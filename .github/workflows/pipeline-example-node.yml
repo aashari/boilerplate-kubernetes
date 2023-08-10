@@ -1,0 +1,154 @@
+name: Pipeline Example Node
+defaults:
+  run:
+    working-directory: backends/example-node
+
+on:
+  push:
+    paths:
+      - "backends/example-node/**"
+      - ".github/workflows/pipeline-example-node.yml"
+
+jobs:
+  
+  # Job: Run Unit Tests
+  test-job:
+    name: Test Example Node
+    runs-on: ubuntu-latest
+    steps:
+
+      # Step 1: Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v3
+    
+      # Step 2: Setup Node
+      - name: Set up Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18.16'
+
+      # Step 3: Install dependencies
+      - name: Install dependencies
+        run: npm install
+    
+      # Step 4: Run unit tests
+      - name: Run Unit Test
+        run: npm test
+
+  # Job: Build Docker Image
+  build-job:
+    name: Build Docker Image - Example Node
+    needs: test-job
+    runs-on: ubuntu-latest
+    environment: production
+    
+    # Add "id-token" with the intended permissions.
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    
+    env:
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      REPOSITORY_LOCATION: 'github.com/${{ github.repository }}/${{ github.ref }}'
+    
+    steps:
+    
+      # Step 1: Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v3
+    
+      # Step 2: Authenticate with Google Cloud
+      - name: Authenticate with Google Cloud
+        uses: 'google-github-actions/auth@v0'
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+    
+      # Step 3: Setup Cloud SDK
+      - name: Setup Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+    
+      # Step 4: Configure Docker to use gcloud as a credential helper
+      - name: Configure Docker to use gcloud as a credential helper
+        run: gcloud auth configure-docker
+    
+      # Step 5: Build docker image
+      - name: Build docker image
+        run: |-
+          
+          # Extract the repository region from GAR_LOCATION
+          REPOSITORY_REGION=$(echo ${{vars.GAR_LOCATION}} | cut -d'-' -f1)
+          
+          # Build the Docker image with necessary tags
+          docker build -t $REPOSITORY_REGION.gcr.io/$GCP_PROJECT_ID/${{ vars.GAR_LOCATION }}/$REPOSITORY_LOCATION:${{github.sha}} .
+    
+      # Step 6: Push docker image
+      - name: Push docker image
+        run: |-
+          
+          # Extract the repository region from GAR_LOCATION
+          REPOSITORY_REGION=$(echo ${{vars.GAR_LOCATION}} | cut -d'-' -f1)
+          
+          # Push the Docker image to the Google Cloud Container Registry
+          docker push $REPOSITORY_REGION.gcr.io/$GCP_PROJECT_ID/${{ vars.GAR_LOCATION }}/$REPOSITORY_LOCATION:${{github.sha}}
+
+  # Job: Deploy to Kubernetes
+  deploy-job:
+    name: Deploy to Kubernetes
+    needs: build-job
+    runs-on: ubuntu-latest
+    environment: production
+    
+    env:
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      REPOSITORY_LOCATION: 'github.com/${{ github.repository }}/${{ github.ref }}'
+    
+    steps:
+    
+      # Step 1: Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v3
+    
+      # Step 2: Authenticate with Google Cloud
+      - name: Authenticate with Google Cloud
+        uses: 'google-github-actions/auth@v0'
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+    
+      # Step 3: Get the GKE credentials so we can deploy to the cluster
+      - name: Set up GKE credentials
+        uses: google-github-actions/get-gke-credentials@v0
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GAR_LOCATION }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          
+      # Step 4: Set up Kustomize
+      - name: Set up Kustomize
+        run: |-
+          
+          # Download and make Kustomize executable
+          curl -sfLo kustomize https://github.com/kubernetes-sigs/kustomize/releases/download/v3.1.0/kustomize_3.1.0_linux_amd64
+          chmod u+x ./kustomize
+        
+      # Step 5: Deploy the Docker image to the GKE cluster
+      - name: Deploy
+        run: |-
+
+          # Get the configuration for the deployment
+          kubectl config view
+          kubectl config current-context
+
+          # Extract the repository region from GAR_LOCATION
+          REPOSITORY_REGION=$(echo ${{vars.GAR_LOCATION}} | cut -d'-' -f1)
+          
+          # Update the image tag in the deployment
+          kustomize edit set image example-node-container:latest=$REPOSITORY_REGION.gcr.io/$GCP_PROJECT_ID/${{ vars.GAR_LOCATION }}/$REPOSITORY_LOCATION:${{ github.sha }}
+
+          # Build the deployment
+          kustomize build . | kubectl apply -f -
+
+          # Wait for the deployment to be ready
+          kubectl rollout status deployment/example-node-deployment
+
+          # Get the external IP address of the service
+          kubectl get service -o wide
